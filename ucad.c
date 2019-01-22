@@ -18,15 +18,20 @@
 #include <glib-object.h>
 #include <gio/gio.h>
 #include <string.h>
+#include <signal.h>
 #include <uca/uca-camera.h>
 #include <uca/uca-plugin-manager.h>
 #include "uca-net-protocol.h"
 #include "config.h"
 
+#ifdef HAVE_UNIX
+#include <glib-unix.h>
+#endif
+
+static GMainLoop *loop;
 
 typedef void (*MessageHandler) (GSocketConnection *connection, UcaCamera *camera, gpointer message, GError **error);
 typedef void (*CameraFunc) (UcaCamera *camera, GError **error);
-
 
 typedef struct {
     UcaNetMessageType type;
@@ -104,7 +109,7 @@ prepare_error_reply (GError *error, UcaNetErrorReply *reply)
     }
 }
 
-static gboolean
+static void
 serialize_param_spec (GParamSpec *pspec, UcaNetMessageProperty *prop)
 {
     strncpy (prop->name, g_param_spec_get_name (pspec), sizeof (prop->name));
@@ -113,6 +118,36 @@ serialize_param_spec (GParamSpec *pspec, UcaNetMessageProperty *prop)
 
     prop->value_type = pspec->value_type;
     prop->flags = pspec->flags;
+    prop->valid = TRUE;
+
+    if (g_type_is_a (pspec->value_type, G_TYPE_ENUM)) {
+        GEnumClass *enum_class;
+
+        enum_class = ((GParamSpecEnum *) pspec)->enum_class;
+        prop->value_type = G_TYPE_ENUM;
+        prop->spec.genum.default_value = ((GParamSpecEnum *) pspec)->default_value;
+        prop->spec.genum.minimum = enum_class->minimum;
+        prop->spec.genum.maximum = enum_class->maximum;
+        prop->spec.genum.n_values = enum_class->n_values;
+
+        if (enum_class->n_values > UCA_NET_MAX_ENUM_LENGTH)
+            g_warning ("Cannot serialize all values of %s", prop->name);
+
+        for (guint i = 0; i < MIN (enum_class->n_values, UCA_NET_MAX_ENUM_LENGTH); i++) {
+            prop->spec.genum.values[i] = enum_class->values[i].value;
+
+            if (strlen (enum_class->values[i].value_name) > UCA_NET_MAX_ENUM_NAME_LENGTH)
+                g_warning ("Enum value name too long, expect serious problems");
+
+            strncpy (prop->spec.genum.value_names[i], enum_class->values[i].value_name,
+                     UCA_NET_MAX_ENUM_NAME_LENGTH);
+
+            strncpy (prop->spec.genum.value_nicks[i], enum_class->values[i].value_nick,
+                     UCA_NET_MAX_ENUM_NAME_LENGTH);
+        }
+
+        return;
+    }
 
 #define CASE_NUMERIC(type, storage, typeclass) \
         case type: \
@@ -130,20 +165,23 @@ serialize_param_spec (GParamSpec *pspec, UcaNetMessageProperty *prop)
             break;
         CASE_NUMERIC (G_TYPE_INT, gint, GParamSpecInt)
             break;
+        CASE_NUMERIC (G_TYPE_INT64, gint64, GParamSpecInt64)
+            break;
         CASE_NUMERIC (G_TYPE_UINT, guint, GParamSpecUInt)
+            break;
+        CASE_NUMERIC (G_TYPE_UINT64, guint64, GParamSpecUInt64)
             break;
         CASE_NUMERIC (G_TYPE_FLOAT, gfloat, GParamSpecFloat)
             break;
         CASE_NUMERIC (G_TYPE_DOUBLE, gdouble, GParamSpecDouble)
             break;
         default:
-            g_warning ("Unsupported property type");
-            return FALSE;
+            g_warning ("Cannot serialize property %s", prop->name);
+            prop->valid = FALSE;
+            break;
     }
 
 #undef CASE_NUMERIC
-
-    return TRUE;
 }
 
 static void
@@ -161,8 +199,8 @@ handle_get_properties_request (GSocketConnection *connection, UcaCamera *camera,
     for (guint i = N_BASE_PROPERTIES - 1; i < num_properties; i++) {
         UcaNetMessageProperty property;
 
-        if (serialize_param_spec (pspecs[i], &property))
-            send_reply (connection, &property, sizeof (property), error);
+        serialize_param_spec (pspecs[i], &property);
+        send_reply (connection, &property, sizeof (property), error);
     }
 
     g_free (pspecs);
@@ -192,6 +230,7 @@ handle_get_property_request (GSocketConnection *connection, UcaCamera *camera, g
     reply.type = request->type;
     strncpy (reply.property_value, g_value_get_string (&str_value), sizeof (reply.property_value));
     send_reply (connection, &reply, sizeof (reply), error);
+    g_value_unset (&str_value);
 }
 
 static void
@@ -211,6 +250,7 @@ handle_set_property_request (GSocketConnection *connection, UcaCamera *camera, g
     g_value_set_string (&str_value, request->property_value);
     g_value_transform (&str_value, &prop_value);
 
+    g_debug ("Setting `%s' to `%s'", request->property_name, request->property_value);
     g_object_set_property (G_OBJECT (camera), request->property_name, &prop_value);
     send_reply (connection, &reply, sizeof (reply), error);
 }
@@ -243,13 +283,13 @@ handle_stop_recording_request (GSocketConnection *connection, UcaCamera *camera,
 static void
 handle_start_readout_request (GSocketConnection *connection, UcaCamera *camera, gpointer message, GError **error)
 {
-    handle_simple_request (connection, camera, message, uca_camera_start_recording, error);
+    handle_simple_request (connection, camera, message, uca_camera_start_readout, error);
 }
 
 static void
 handle_stop_readout_request (GSocketConnection *connection, UcaCamera *camera, gpointer message, GError **error)
 {
-    handle_simple_request (connection, camera, message, uca_camera_stop_recording, error);
+    handle_simple_request (connection, camera, message, uca_camera_stop_readout, error);
 }
 
 static void
@@ -333,12 +373,14 @@ handle_write_request_cleanup:
     g_free (buffer);
 }
 
-static void
-serve_connection (GSocketConnection *connection, UcaCamera *camera)
+static gboolean
+run_callback (GSocketService *service, GSocketConnection *connection, GObject *source, gpointer user_data)
 {
     GInputStream *input;
+    UcaCamera *camera;
+    UcaNetMessageDefault *message;
     gchar *buffer;
-    gboolean active;
+    GError *error = NULL;
 
     HandlerTable table[] = {
         { UCA_NET_MESSAGE_GET_PROPERTIES,   handle_get_properties_request },
@@ -354,34 +396,23 @@ serve_connection (GSocketConnection *connection, UcaCamera *camera)
         { UCA_NET_MESSAGE_INVALID,          NULL }
     };
 
+    camera = UCA_CAMERA (user_data);
     buffer = g_malloc0 (4096);
     input = g_io_stream_get_input_stream (G_IO_STREAM (connection));
-    active = TRUE;
 
-    while (active) {
-        UcaNetMessageDefault *message;
-        GError *error = NULL;
-
-        /* looks dangerous */
-        g_input_stream_read (input, buffer, 4096, NULL, &error);
-        message = (UcaNetMessageDefault *) buffer;
+    /* looks dangerous */
+    g_input_stream_read (input, buffer, 4096, NULL, &error);
+    message = (UcaNetMessageDefault *) buffer;
 
 #if (GLIB_CHECK_VERSION (2, 36, 0))
-        if (g_error_matches (error, G_IO_ERROR, G_IO_ERROR_BROKEN_PIPE)) {
+    if (g_error_matches (error, G_IO_ERROR, G_IO_ERROR_BROKEN_PIPE)) {
 #else
-        if (g_error_matches (error, G_IO_ERROR, G_IO_ERROR_FAILED)) {
+    if (g_error_matches (error, G_IO_ERROR, G_IO_ERROR_FAILED)) {
 #endif
-            g_error_free (error);
-            error = NULL;
-            active = FALSE;
-            break;
-        }
-
-        if (message->type == UCA_NET_MESSAGE_CLOSE_CONNECTION) {
-            active = FALSE;
-            break;
-        }
-
+        g_error_free (error);
+        error = NULL;
+    }
+    else {
         for (guint i = 0; table[i].type != UCA_NET_MESSAGE_INVALID; i++) {
             if (table[i].type == message->type)
                 table[i].handler (connection, camera, buffer, &error);
@@ -390,37 +421,16 @@ serve_connection (GSocketConnection *connection, UcaCamera *camera)
         if (error != NULL) {
             g_warning ("Error handling requests: %s", error->message);
             g_error_free (error);
-            active = FALSE;
         }
     }
 
     g_free (buffer);
-}
-
-static gboolean
-run_callback (GSocketService *service, GSocketConnection *connection, GObject *source, gpointer user_data)
-{
-    GInetSocketAddress *sock_address;
-    GInetAddress *address;
-    gchar *address_string;
-
-    sock_address = G_INET_SOCKET_ADDRESS (g_socket_connection_get_remote_address (connection, NULL));
-    address = g_inet_socket_address_get_address (sock_address);
-    address_string = g_inet_address_to_string (address);
-    g_message ("Connection accepted from %s:%u", address_string, g_inet_socket_address_get_port (sock_address));
-
-    g_free (address_string);
-    g_object_unref (sock_address);
-
-    serve_connection (connection, UCA_CAMERA (user_data));
-    
     return FALSE;
 }
 
 static void
 serve (UcaCamera *camera, guint16 port, GError **error)
 {
-    GMainLoop *loop;
     GSocketService *service;
 
     service = g_threaded_socket_service_new (1);
@@ -431,6 +441,11 @@ serve (UcaCamera *camera, guint16 port, GError **error)
     g_signal_connect (service, "run", G_CALLBACK (run_callback), camera);
 
     loop = g_main_loop_new (NULL, TRUE);
+
+#ifdef HAVE_UNIX
+    g_unix_signal_add (SIGINT, (GSourceFunc) g_main_loop_quit, loop);
+#endif
+
     g_main_loop_run (loop);
 }
 
@@ -457,7 +472,7 @@ main (int argc, char **argv)
     g_option_context_add_main_entries (context, entries, NULL);
 
     if (!g_option_context_parse (context, &argc, &argv, &error)) {
-        g_print ("Failed parsing arguments: %s\n", error->message);
+        g_printerr ("Failed parsing arguments: %s\n", error->message);
         goto cleanup_manager;
     }
 
@@ -469,22 +484,25 @@ main (int argc, char **argv)
     camera = uca_plugin_manager_get_camera (manager, argv[argc - 1], &error, NULL);
 
     if (camera == NULL) {
-        g_print ("Error during initialization: %s\n", error->message);
-        goto cleanup_camera;
+        g_printerr ("Error during initialization: %s\n", error->message);
+        goto cleanup_manager;
     }
 
     if (!uca_camera_parse_arg_props (camera, argv, argc - 1, &error)) {
-        g_print ("Error setting properties: %s\n", error->message);
+        g_printerr ("Error setting properties: %s\n", error->message);
         goto cleanup_manager;
     }
+
     if (error != NULL)
-        g_print ("Error: %s\n", error->message);
+        g_printerr ("Error: %s\n", error->message);
 
     g_option_context_free (context);
 
     serve (camera, port, &error);
 
-cleanup_camera:
+    if (error != NULL)
+        g_printerr ("Error: %s\n", error->message);
+
     g_object_unref (camera);
 
 cleanup_manager:
