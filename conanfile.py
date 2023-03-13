@@ -13,7 +13,7 @@ class UcaConan(ConanFile):
     options = {"shared": [True, False]}
     default_options = "shared=False"
     generators = "cmake"
-    exports_sources = "src/*", "include/*", "test/*", "bin/*", "CMakeLists.txt", "package.sh.in"
+    exports_sources = "*.h", "*.c", "include/*", "test/*", "bin/*", "CMakeLists.txt", "config.h.in", "package.sh.in"
     requires = "libuca/2.3.0",
 
     def _configured_cmake(self):
@@ -30,3 +30,8 @@ class UcaConan(ConanFile):
     def imports(self):
         self.copy("*.dll", "bin", "bin")
         self.copy("*.dylib", "lib", "lib")
+        
+    def deploy(self):
+        self.copy("*.exe")
+        self.copy("*.dll")
+        self.copy_deps("*.dll")
