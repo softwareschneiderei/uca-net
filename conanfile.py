@@ -11,7 +11,7 @@ class UcaConan(ConanFile):
     topics = ("utilities",)
     settings = "os", "compiler", "build_type", "arch"
     options = {"shared": [True, False]}
-    default_options = "shared=False"
+    default_options = {"shared": True}
     generators = "cmake"
     exports_sources = "*.h", "*.c", "include/*", "test/*", "bin/*", "CMakeLists.txt", "config.h.in", "package.sh.in"
     requires = "libuca/2.3.0",
